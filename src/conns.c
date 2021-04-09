@@ -61,21 +61,6 @@ struct conn_s *initialize_conn (int client_fd, const char *ipaddr,
         connptr->cbuffer = cbuffer;
         connptr->sbuffer = sbuffer;
 
-        connptr->request_line = NULL;
-
-        /* These store any error strings */
-        connptr->error_variables = NULL;
-        connptr->error_string = NULL;
-        connptr->error_number = -1;
-
-        connptr->connect_method = CM_FALSE;
-        connptr->show_stats = FALSE;
-
-        connptr->protocol.major = connptr->protocol.minor = 0;
-
-        /* There is _no_ content length initially */
-        connptr->content_length.server = connptr->content_length.client = -1;
-
         connptr->server_ip_addr = (sock_ipaddr ?
                                    safestrdup (sock_ipaddr) : NULL);
         connptr->client_ip_addr = safestrdup (ipaddr);

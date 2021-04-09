@@ -28,7 +28,7 @@
 #include "log.h"
 #include "network.h"
 #include "sock.h"
-#include "vector.h"
+#include "sblist.h"
 
 #include <limits.h>
 
@@ -111,10 +111,10 @@ fill_netmask_array (char *bitmask_string, int v6,
 /**
  * If the access list has not been set up, create it.
  */
-static int init_access_list(vector_t *access_list)
+static int init_access_list(acl_list_t *access_list)
 {
         if (!*access_list) {
-                *access_list = vector_create ();
+                *access_list = sblist_new(sizeof(struct acl_s), 16);
                 if (!*access_list) {
                         log_message (LOG_ERR,
                                      "Unable to allocate memory for access list");
@@ -135,18 +135,15 @@ static int init_access_list(vector_t *access_list)
  *     0 otherwise.
  */
 int
-insert_acl (char *location, acl_access_t access_type, vector_t *access_list)
+insert_acl (char *location, acl_access_t access_type, acl_list_t *access_list)
 {
         struct acl_s acl;
-        int ret;
-        char *p, ip_dst[IPV6_LEN];
+        char *mask, ip_dst[IPV6_LEN];
 
         assert (location != NULL);
 
-        ret = init_access_list(access_list);
-        if (ret != 0) {
+        if (init_access_list(access_list) != 0)
                 return -1;
-        }
 
         /*
          * Start populating the access control structure.
@@ -154,35 +151,19 @@ insert_acl (char *location, acl_access_t access_type, vector_t *access_list)
         memset (&acl, 0, sizeof (struct acl_s));
         acl.access = access_type;
 
+        if ((mask = strrchr(location, '/')))
+                *(mask++) = 0;
+
         /*
          * Check for a valid IP address (the simplest case) first.
          */
         if (full_inet_pton (location, ip_dst) > 0) {
                 acl.type = ACL_NUMERIC;
                 memcpy (acl.address.ip.network, ip_dst, IPV6_LEN);
-                memset (acl.address.ip.mask, 0xff, IPV6_LEN);
-        } else {
-                int i;
-
-                /*
-                 * At this point we're either a hostname or an
-                 * IP address with a slash.
-                 */
-                p = strchr (location, '/');
-                if (p != NULL) {
+                if(!mask) memset (acl.address.ip.mask, 0xff, IPV6_LEN);
+                else {
                         char dst[sizeof(struct in6_addr)];
-                        int v6;
-
-                        /*
-                         * We have a slash, so it's intended to be an
-                         * IP address with mask
-                         */
-                        *p = '\0';
-                        if (full_inet_pton (location, ip_dst) <= 0)
-                                return -1;
-
-                        acl.type = ACL_NUMERIC;
-
+                        int v6, i;
                         /* Check if the IP address before the netmask is
                          * an IPv6 address */
                         if (inet_pton(AF_INET6, location, dst) > 0)
@@ -191,24 +172,33 @@ insert_acl (char *location, acl_access_t access_type, vector_t *access_list)
                                 v6 = 0;
 
                         if (fill_netmask_array
-                            (p + 1, v6, &(acl.address.ip.mask[0]), IPV6_LEN)
+                            (mask, v6, &(acl.address.ip.mask[0]), IPV6_LEN)
                             < 0)
-                                return -1;
+                                goto err;
 
                         for (i = 0; i < IPV6_LEN; i++)
                                 acl.address.ip.network[i] = ip_dst[i] &
                                         acl.address.ip.mask[i];
-                } else {
-                        /* In all likelihood a string */
-                        acl.type = ACL_STRING;
-                        acl.address.string = safestrdup (location);
-                        if (!acl.address.string)
-                                return -1;
                 }
+        } else {
+                /* either bogus IP or hostname */
+                            /* bogus ipv6 ? */
+                if (mask || strchr (location, ':'))
+                        goto err;
+
+                /* In all likelihood a string */
+                acl.type = ACL_STRING;
+                acl.address.string = safestrdup (location);
+                if (!acl.address.string)
+                        goto err;
         }
 
-        ret = vector_append (*access_list, &acl, sizeof (struct acl_s));
-        return ret;
+        if(!sblist_add(*access_list, &acl)) return -1;
+        return 0;
+err:;
+	/* restore mask for proper error message */
+	if(mask) *(--mask) = '/';
+	return -1;
 }
 
 /*
@@ -221,8 +211,8 @@ insert_acl (char *location, acl_access_t access_type, vector_t *access_list)
  *        -1 if no tests match, so skip
  */
 static int
-acl_string_processing (struct acl_s *acl,
-                       const char *ip_address, const char *string_address)
+acl_string_processing (struct acl_s *acl, const char *ip_address,
+                       union sockaddr_union *addr, char *string_addr)
 {
         int match;
         struct addrinfo hints, *res, *ressave;
@@ -231,7 +221,6 @@ acl_string_processing (struct acl_s *acl,
 
         assert (acl && acl->type == ACL_STRING);
         assert (ip_address && strlen (ip_address) > 0);
-        assert (string_address && strlen (string_address) > 0);
 
         /*
          * If the first character of the ACL string is a period, we need to
@@ -267,7 +256,15 @@ acl_string_processing (struct acl_s *acl,
         }
 
 STRING_TEST:
-        test_length = strlen (string_address);
+        if(string_addr[0] == 0) {
+                /* only do costly hostname resolution when it is absolutely needed,
+                   and only once */
+                if(getnameinfo ((void *) addr, sizeof (*addr),
+                                string_addr, HOSTNAME_LENGTH, NULL, 0, 0) != 0)
+                        return -1;
+        }
+
+        test_length = strlen (string_addr);
         match_length = strlen (acl->address.string);
 
         /*
@@ -278,7 +275,7 @@ STRING_TEST:
                 return -1;
 
         if (strcasecmp
-            (string_address + (test_length - match_length),
+            (string_addr + (test_length - match_length),
              acl->address.string) == 0) {
                 if (acl->access == ACL_DENY)
                         return 0;
@@ -298,16 +295,12 @@ STRING_TEST:
  *   0  IP address is denied
  *  -1  neither allowed nor denied.
  */
-static int check_numeric_acl (const struct acl_s *acl, const char *ip)
+static int check_numeric_acl (const struct acl_s *acl, uint8_t addr[IPV6_LEN])
 {
-        uint8_t addr[IPV6_LEN], x, y;
+        uint8_t x, y;
         int i;
 
         assert (acl && acl->type == ACL_NUMERIC);
-        assert (ip && strlen (ip) > 0);
-
-        if (full_inet_pton (ip, &addr) <= 0)
-                return -1;
 
         for (i = 0; i != IPV6_LEN; ++i) {
                 x = addr[i] & acl->address.ip.mask[i];
@@ -329,14 +322,18 @@ static int check_numeric_acl (const struct acl_s *acl, const char *ip)
  *     1 if allowed
  *     0 if denied
  */
-int check_acl (const char *ip, const char *host, vector_t access_list)
+int check_acl (const char *ip, union sockaddr_union *addr, acl_list_t access_list)
 {
         struct acl_s *acl;
-        int perm = 0;
+        int perm = 0, is_numeric_addr;
         size_t i;
+        char string_addr[HOSTNAME_LENGTH];
+        uint8_t numeric_addr[IPV6_LEN];
 
         assert (ip != NULL);
-        assert (host != NULL);
+        assert (addr != NULL);
+
+        string_addr[0] = 0;
 
         /*
          * If there is no access list allow everything.
@@ -344,17 +341,22 @@ int check_acl (const char *ip, const char *host, vector_t access_list)
         if (!access_list)
                 return 1;
 
-        for (i = 0; i != (size_t) vector_length (access_list); ++i) {
-                acl = (struct acl_s *) vector_getentry (access_list, i, NULL);
+        is_numeric_addr = (full_inet_pton (ip, &numeric_addr) > 0);
+
+        for (i = 0; i < sblist_getsize (access_list); ++i) {
+                acl = sblist_get (access_list, i);
                 switch (acl->type) {
                 case ACL_STRING:
-                        perm = acl_string_processing (acl, ip, host);
+                        perm = acl_string_processing (acl, ip, addr, string_addr);
                         break;
 
                 case ACL_NUMERIC:
                         if (ip[0] == '\0')
                                 continue;
-                        perm = check_numeric_acl (acl, ip);
+
+                        perm = is_numeric_addr
+                               ? check_numeric_acl (acl, numeric_addr)
+                               : -1;
                         break;
                 }
 
@@ -371,12 +373,12 @@ int check_acl (const char *ip, const char *host, vector_t access_list)
         /*
          * Deny all connections by default.
          */
-        log_message (LOG_NOTICE, "Unauthorized connection from \"%s\" [%s].",
-                     host, ip);
+        log_message (LOG_NOTICE, "Unauthorized connection from \"%s\".",
+                     ip);
         return 0;
 }
 
-void flush_access_list (vector_t access_list)
+void flush_access_list (acl_list_t access_list)
 {
         struct acl_s *acl;
         size_t i;
@@ -390,12 +392,12 @@ void flush_access_list (vector_t access_list)
          * before we can free the acl entries themselves.
          * A hierarchical memory system would be great...
          */
-        for (i = 0; i != (size_t) vector_length (access_list); ++i) {
-                acl = (struct acl_s *) vector_getentry (access_list, i, NULL);
+        for (i = 0; i < sblist_getsize (access_list); ++i) {
+                acl = sblist_get (access_list, i);
                 if (acl->type == ACL_STRING) {
                         safefree (acl->address.string);
                 }
         }
 
-        vector_delete (access_list);
+        sblist_free (access_list);
 }

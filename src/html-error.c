@@ -20,9 +20,9 @@
  * HTML error pages with variable substitution.
  */
 
+#include "common.h"
 #include "main.h"
 
-#include "common.h"
 #include "buffer.h"
 #include "conns.h"
 #include "heap.h"
@@ -31,25 +31,33 @@
 #include "utils.h"
 #include "conf.h"
 
+#include <regex.h>
+
 /*
  * Add an error number -> filename mapping to the errorpages list.
  */
 #define ERRORNUM_BUFSIZE 8      /* this is more than required */
 #define ERRPAGES_BUCKETCOUNT 16
 
-int add_new_errorpage (char *filepath, unsigned int errornum)
+int add_new_errorpage (struct config_s *conf, char *filepath,
+                       unsigned int errornum)
 {
-        char errornbuf[ERRORNUM_BUFSIZE];
+        char errornbuf[ERRORNUM_BUFSIZE], *k;
 
-        config.errorpages = hashmap_create (ERRPAGES_BUCKETCOUNT);
-        if (!config.errorpages)
+        if (!conf->errorpages)
+                conf->errorpages = htab_create (ERRPAGES_BUCKETCOUNT);
+        if (!conf->errorpages)
                 return (-1);
 
         snprintf (errornbuf, ERRORNUM_BUFSIZE, "%u", errornum);
 
-        if (hashmap_insert (config.errorpages, errornbuf,
-                            filepath, strlen (filepath) + 1) < 0)
+        k = safestrdup(errornbuf);
+        if (!k) return -1;
+
+        if (!htab_insert (conf->errorpages, k, HTV_P(filepath))) {
+                safefree(k);
                 return (-1);
+        }
 
         return (0);
 }
@@ -59,28 +67,51 @@ int add_new_errorpage (char *filepath, unsigned int errornum)
  */
 static char *get_html_file (unsigned int errornum)
 {
-        hashmap_iter result_iter;
         char errornbuf[ERRORNUM_BUFSIZE];
-        char *key;
-        char *val;
+        htab_value *hv;
 
         assert (errornum >= 100 && errornum < 1000);
 
-        if (!config.errorpages)
-                return (config.errorpage_undef);
+        if (!config->errorpages)
+                return (config->errorpage_undef);
 
         snprintf (errornbuf, ERRORNUM_BUFSIZE, "%u", errornum);
 
-        result_iter = hashmap_find (config.errorpages, errornbuf);
+        hv = htab_find (config->errorpages, errornbuf);
+        if (!hv) return (config->errorpage_undef);
+        return hv->p;
+}
 
-        if (hashmap_is_end (config.errorpages, result_iter))
-                return (config.errorpage_undef);
+static char *lookup_variable (struct htab *map, const char *varname) {
+	htab_value *v;
+	v = htab_find(map, varname);
+	return v ? v->p : 0;
+}
 
-        if (hashmap_return_entry (config.errorpages, result_iter,
-                                  &key, (void **) &val) < 0)
-                return (config.errorpage_undef);
-
-        return (val);
+static void varsubst_sendline(struct conn_s *connptr, regex_t *re, char *p) {
+	int fd = connptr->client_fd;
+	while(*p) {
+		regmatch_t match;
+		char varname[32+1], *varval;
+		size_t l;
+		int st = regexec(re, p, 1, &match, 0);
+		if(st == 0) {
+			if(match.rm_so > 0) safe_write(fd, p, match.rm_so);
+			l = match.rm_eo - match.rm_so;
+			assert(l>2 && l-2 < sizeof(varname));
+			p += match.rm_so;
+			memcpy(varname, p+1, l-2);
+			varname[l-2] = 0;
+			varval = lookup_variable(connptr->error_variables, varname);
+			if(varval) write_message(fd, "%s", varval);
+			else if(varval && !*varval) write_message(fd, "(unknown)");
+			else safe_write(fd, p, l);
+			p += l;
+		} else {
+			write_message(fd, "%s", p);
+			break;
+		}
+	}
 }
 
 /*
@@ -89,73 +120,22 @@ static char *get_html_file (unsigned int errornum)
 int
 send_html_file (FILE *infile, struct conn_s *connptr)
 {
-        char *inbuf;
-        char *varstart = NULL;
-        char *p;
-        const char *varval;
-        int in_variable = 0;
-        int r = 0;
+        regex_t re;
+        char *inbuf = safemalloc (4096);
+        (void) regcomp(&re, "{[a-z]\\{1,32\\}}", 0);
 
-        inbuf = (char *) safemalloc (4096);
-
-        while (fgets (inbuf, 4096, infile) != NULL) {
-                for (p = inbuf; *p; p++) {
-                        switch (*p) {
-                        case '}':
-                                if (in_variable) {
-                                        *p = '\0';
-                                        varval = (const char *)
-                                                lookup_variable (connptr->error_variables,
-                                                                 varstart);
-                                        if (!varval)
-                                                varval = "(unknown)";
-                                        r = write_message (connptr->client_fd,
-                                                           "%s", varval);
-                                        in_variable = 0;
-                                } else {
-                                        r = write_message (connptr->client_fd,
-                                                           "%c", *p);
-                                }
-
-                                break;
-
-                        case '{':
-                                /* a {{ will print a single {.  If we are NOT
-                                 * already in a { variable, then proceed with
-                                 * setup.  If we ARE already in a { variable,
-                                 * this code will fallthrough to the code that
-                                 * just dumps a character to the client fd.
-                                 */
-                                if (!in_variable) {
-                                        varstart = p + 1;
-                                        in_variable++;
-                                } else
-                                        in_variable = 0;
-
-                                /* FALL THROUGH */
-                        default:
-                                if (!in_variable) {
-                                        r = write_message (connptr->client_fd,
-                                                           "%c", *p);
-                                }
-                        }
-
-                        if (r)
-                                break;
-                }
-
-                if (r)
-                        break;
-
-                in_variable = 0;
+        while (fgets (inbuf, 4096, infile)) {
+                varsubst_sendline(connptr, &re, inbuf);
         }
 
+        regfree (&re);
         safefree (inbuf);
-
-        return r;
+        return 1;
 }
 
-int send_http_headers (struct conn_s *connptr, int code, const char *message)
+int send_http_headers (
+        struct conn_s *connptr, int code,
+        const char *message, const char *extra)
 {
         const char headers[] =
             "HTTP/1.0 %d %s\r\n"
@@ -164,17 +144,9 @@ int send_http_headers (struct conn_s *connptr, int code, const char *message)
             "%s"
             "Connection: close\r\n" "\r\n";
 
-        const char auth_str[] =
-            "Proxy-Authenticate: Basic realm=\""
-            PACKAGE_NAME "\"\r\n";
-
-	/* according to rfc7235, the 407 error must be accompanied by
-           a Proxy-Authenticate header field. */
-        const char *add = code == 407 ? auth_str : "";
-
         return (write_message (connptr->client_fd, headers,
                                code, message, PACKAGE, VERSION,
-                               add));
+                               extra));
 }
 
 /*
@@ -198,8 +170,21 @@ int send_http_error_message (struct conn_s *connptr)
             "<p><em>Generated by %s version %s.</em></p>\n" "</body>\n"
             "</html>\n";
 
+        const char p_auth_str[] =
+            "Proxy-Authenticate: Basic realm=\""
+            PACKAGE_NAME "\"\r\n";
+
+        const char w_auth_str[] =
+            "WWW-Authenticate: Basic realm=\""
+            PACKAGE_NAME "\"\r\n";
+
+	/* according to rfc7235, the 407 error must be accompanied by
+           a Proxy-Authenticate header field. */
+        const char *add = connptr->error_number == 407 ? p_auth_str :
+                          (connptr->error_number == 401 ? w_auth_str : "");
+
         send_http_headers (connptr, connptr->error_number,
-                           connptr->error_string);
+                           connptr->error_string, add);
 
         error_file = get_html_file (connptr->error_number);
         if (!(infile = fopen (error_file, "r"))) {
@@ -225,14 +210,25 @@ int send_http_error_message (struct conn_s *connptr)
 int
 add_error_variable (struct conn_s *connptr, const char *key, const char *val)
 {
+	char *k, *v;
+
         if (!connptr->error_variables)
                 if (!
                     (connptr->error_variables =
-                     hashmap_create (ERRVAR_BUCKETCOUNT)))
+                     htab_create (ERRVAR_BUCKETCOUNT)))
                         return (-1);
 
-        return hashmap_insert (connptr->error_variables, key, val,
-                               strlen (val) + 1);
+        k = safestrdup(key);
+        v = safestrdup(val);
+
+        if (!v || !k) goto oom;
+
+        if(htab_insert (connptr->error_variables, k, HTV_P(v)))
+                return 1;
+oom:;
+	safefree(k);
+	safefree(v);
+	return -1;
 }
 
 #define ADD_VAR_RET(x, y)				   \
@@ -251,6 +247,7 @@ int add_standard_vars (struct conn_s *connptr)
         char errnobuf[16];
         char timebuf[30];
         time_t global_time;
+        struct tm tm_buf;
 
         snprintf (errnobuf, sizeof errnobuf, "%d", connptr->error_number);
         ADD_VAR_RET ("errno", errnobuf);
@@ -258,7 +255,6 @@ int add_standard_vars (struct conn_s *connptr)
         ADD_VAR_RET ("cause", connptr->error_string);
         ADD_VAR_RET ("request", connptr->request_line);
         ADD_VAR_RET ("clientip", connptr->client_ip_addr);
-        ADD_VAR_RET ("clienthost", connptr->client_string_addr);
 
         /* The following value parts are all non-NULL and will
          * trigger warnings in ADD_VAR_RET(), so we use
@@ -267,7 +263,7 @@ int add_standard_vars (struct conn_s *connptr)
 
         global_time = time (NULL);
         strftime (timebuf, sizeof (timebuf), "%a, %d %b %Y %H:%M:%S GMT",
-                  gmtime (&global_time));
+                  gmtime_r (&global_time, &tm_buf));
         add_error_variable (connptr, "date", timebuf);
 
         add_error_variable (connptr, "website",
